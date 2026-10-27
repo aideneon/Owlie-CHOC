@@ -1,0 +1,5 @@
+{
+  "projects": {
+    "default": "dbt-app-web-demo"
+  }
+}

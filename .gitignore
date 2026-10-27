@@ -1,0 +1,12 @@
+__MACOSX/
+**/.firebase/
+**/.dart_tool/
+**/build/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.pub-cache/
+**/.pub/
+**/dbt_app_web_demo/
+.DS_Store
+*.iml
+*.log
