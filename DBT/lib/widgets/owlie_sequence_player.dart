@@ -23,6 +23,7 @@ class OwlieSequencePlayer extends StatefulWidget {
     this.replayToken = 0,
     this.deferReplayWhileCovered = false,
     this.fit = BoxFit.contain,
+    this.circular = false,
   });
 
   final List<String> speechAssets;
@@ -34,6 +35,10 @@ class OwlieSequencePlayer extends StatefulWidget {
   final bool deferReplayWhileCovered;
 
   final BoxFit fit;
+
+  /// Exercise header is clipped to a circle. The fade overlay has to use the
+  /// same circle or the owl turns into a square while clips change.
+  final bool circular;
 
   @override
   State<OwlieSequencePlayer> createState() => _OwlieSequencePlayerState();
@@ -65,6 +70,10 @@ class _OwlieSequencePlayerState extends State<OwlieSequencePlayer>
   int? _heldSpeechIndex;
   bool _playingAmbient = false;
   bool _transitioning = false;
+  bool _preparingNext = false;
+  bool _incomingReady = false;
+  bool _holdingLastFrame = false;
+  double? _boxAspect;
   bool _keepOutgoingAudio = false;
   bool _silentIncoming = false;
   bool _covered = false;
@@ -152,6 +161,10 @@ class _OwlieSequencePlayerState extends State<OwlieSequencePlayer>
     _index = 0;
     _playingAmbient = false;
     _pendingReplay = false;
+    _incomingReady = false;
+    _preparingNext = false;
+    _holdingLastFrame = false;
+    _boxAspect = null;
     _heldSpeechIndex = null;
     _stall.fired = false;
     _stall.seenFrame = false;
@@ -232,17 +245,101 @@ class _OwlieSequencePlayerState extends State<OwlieSequencePlayer>
   void _maybeAdvance(_Slot slot) {
     // A held speech clip keeps its audio under the idle picture. The idle
     // clip itself still has to loop, so only block advance for the speech.
-    if (_transitioning || _covered) return;
+    if (_covered) return;
     if (_held != null && !_playingAmbient) return;
     final value = slot.controller.value;
     if (!value.isInitialized || value.duration == Duration.zero) return;
     final remaining = value.duration - value.position;
+
+    // `ended` clears the frame for a moment. Pause just before that, and
+    // only when the next picture is not ready, so the backdrop cannot flash.
+    if (!_incomingReady &&
+        !_holdingLastFrame &&
+        value.isPlaying &&
+        remaining > Duration.zero &&
+        remaining < const Duration(milliseconds: 80)) {
+      _holdingLastFrame = true;
+      unawaited(slot.controller.pause());
+    }
+
+    if (!_incomingReady &&
+        !_preparingNext &&
+        !_transitioning &&
+        value.position > Duration.zero &&
+        remaining < const Duration(milliseconds: 1600)) {
+      _preparingNext = true;
+      unawaited(_armNext(_nextPath()));
+    }
+
+    if (_transitioning || !_incomingReady) return;
     final due =
         value.isCompleted ||
-        (value.position > Duration.zero && remaining <= playbackFade);
+        (value.position > Duration.zero &&
+            remaining <= playbackFade + handoffLead);
     if (!due) return;
     _transitioning = true;
-    unawaited(_runFade(_nextPath(), gen: _generation, alreadyMarked: true));
+    unawaited(_playArmedFade());
+  }
+
+  /// Decodes the next clip's first frame while it is still invisible, so the
+  /// fade itself does not wait on a load and uncover the backdrop.
+  Future<void> _armNext(String path) async {
+    final gen = _generation;
+    _Slot? opened;
+    try {
+      final next = await _open(path, gen);
+      opened = next;
+      if (next == null || gen != _generation || !mounted) {
+        await _releaseSlot(next);
+        return;
+      }
+      setState(() => _incoming = next);
+      await WidgetsBinding.instance.endOfFrame;
+      if (gen != _generation || !mounted) return;
+      next.elementId ??= claimClipElement(clipFileName(path));
+      _setClipOpacity(next, 0);
+      final fileName = clipFileName(path);
+      await waitUntilCanPlayThrough(fileName);
+      await waitUntilVisible(fileName);
+      if (gen != _generation || !mounted) return;
+      await _primeFirstFrame(next);
+      if (gen != _generation || !mounted || next.released) return;
+      _setClipOpacity(next, 0);
+      _incomingReady = true;
+      final current = _current;
+      final playing = current != null &&
+          current.controller.value.isInitialized &&
+          current.controller.value.isPlaying;
+      if (!playing && current != null && !_transitioning) {
+        _transitioning = true;
+        unawaited(_playArmedFade());
+      }
+    } catch (_) {
+      if (identical(_incoming, opened)) {
+        _incoming = null;
+        await _releaseSlot(opened);
+      }
+    } finally {
+      if (gen == _generation) _preparingNext = false;
+    }
+  }
+
+  Future<void> _playArmedFade() async {
+    final next = _incoming;
+    final gen = _generation;
+    if (next == null || next.released || !mounted) {
+      _transitioning = false;
+      _incomingReady = false;
+      return;
+    }
+    _incomingReady = false;
+    _keepOutgoingAudio = false;
+    _silentIncoming = false;
+    try {
+      await _reveal(next, keepOutgoingAudio: false, silentIncoming: false);
+    } finally {
+      if (gen == _generation) _transitioning = false;
+    }
   }
 
   Future<void> _holdWithIdle() async {
@@ -323,41 +420,12 @@ class _OwlieSequencePlayerState extends State<OwlieSequencePlayer>
 
       _keepOutgoingAudio = keepOutgoingAudio;
       _silentIncoming = silentIncoming;
-      _fade.removeListener(_applyMix);
-      _fade.addListener(_applyMix);
-      try {
-        await next.controller.play();
-        await _fade.forward(from: 0);
-      } finally {
-        if (gen == _generation) _fade.removeListener(_applyMix);
-      }
+      await _reveal(
+        next,
+        keepOutgoingAudio: keepOutgoingAudio,
+        silentIncoming: silentIncoming,
+      );
       if (gen != _generation || !mounted) return;
-
-      final outgoing = _current;
-      setState(() {
-        _current = next;
-        _incoming = null;
-      });
-      if (keepOutgoingAudio) _heldSpeechIndex = _index;
-      _commitArrived(path);
-      _stall
-        ..fired = false
-        ..seenFrame = false
-        ..stuckTicks = 0
-        ..frames = 0
-        ..anchor = Duration.zero;
-
-      if (keepOutgoingAudio && outgoing != null) {
-        _held = outgoing;
-        outgoing.appliedVolume = -1;
-        await VideoCache.setMixVolume(outgoing.controller, 1);
-        outgoing.appliedVolume = 1;
-      } else {
-        await _releaseSlot(outgoing);
-      }
-      final audible = _held == null ? 1.0 : 0.0;
-      next.appliedVolume = audible;
-      VideoCache.requestMixVolume(next.controller, audible);
       next = null;
     } catch (_) {
       if (mounted && gen == _generation && _current == null) {
@@ -412,10 +480,106 @@ class _OwlieSequencePlayerState extends State<OwlieSequencePlayer>
     } catch (_) {}
   }
 
+  /// Puts [next] on screen without ever making the visible picture transparent.
+  ///
+  /// A still of the old frame covers the owl, the clips swap underneath it,
+  /// then that still fades out onto the new clip. Fading the videos themselves
+  /// shows the page background, because a half-transparent platform view is a
+  /// hole.
+  Future<void> _reveal(
+    _Slot next, {
+    required bool keepOutgoingAudio,
+    required bool silentIncoming,
+  }) async {
+    final outgoing = _current;
+    _setClipOpacity(next, 1);
+    if (outgoing != null) _setClipOpacity(outgoing, 1);
+    outgoing?.elementId ??= claimClipElement(clipFileName(outgoing.path));
+    next.elementId ??= claimClipElement(clipFileName(next.path));
+    final mix = _mixAudio(
+      outgoing,
+      next,
+      keepOutgoingAudio: keepOutgoingAudio,
+      silentIncoming: silentIncoming,
+    );
+
+    Future<void> swap() async {
+      if (!mounted || next.released) return;
+      await next.controller.play();
+      _setClipOpacity(next, 1);
+      if (!silentIncoming) {
+        next.appliedVolume = -1;
+        VideoCache.requestMixVolume(next.controller, 1);
+      }
+      setState(() {
+        _current = next;
+        _incoming = null;
+        if (keepOutgoingAudio && outgoing != null) _held = outgoing;
+      });
+      if (keepOutgoingAudio) _heldSpeechIndex = _index;
+      _commitArrived(next.path);
+      _stall
+        ..fired = false
+        ..seenFrame = false
+        ..stuckTicks = 0
+        ..frames = 0
+        ..anchor = Duration.zero;
+      _holdingLastFrame = false;
+      await WidgetsBinding.instance.endOfFrame;
+      if (!keepOutgoingAudio) await _releaseSlot(outgoing);
+      if (keepOutgoingAudio && outgoing != null) _setClipOpacity(outgoing, 0);
+    }
+
+    final fromId = outgoing?.elementId;
+    final toId = next.elementId;
+    if (kIsWeb && outgoing != null && fromId != null && toId != null) {
+      await next.controller.play();
+      await dissolveUnderStill(
+        fromId: fromId,
+        toId: toId,
+        circular: widget.circular,
+        milliseconds: playbackFade.inMilliseconds,
+        swapUnderStill: swap,
+      );
+    } else {
+      await swap();
+    }
+
+    if (!keepOutgoingAudio && outgoing != null && !outgoing.released) {
+      await _releaseSlot(outgoing);
+    }
+    await mix;
+    if (!next.released && !silentIncoming && _held == null) {
+      next.appliedVolume = -1;
+      VideoCache.requestMixVolume(next.controller, 1);
+    }
+  }
+
+  Future<void> _mixAudio(
+    _Slot? from,
+    _Slot to, {
+    required bool keepOutgoingAudio,
+    required bool silentIncoming,
+  }) async {
+    const steps = 10;
+    final stepMs = playbackFade.inMilliseconds ~/ steps;
+    for (var i = 1; i <= steps; i++) {
+      if (!mounted) return;
+      final t = Curves.easeInOut.transform(i / steps);
+      if (from != null && !from.released && !keepOutgoingAudio) {
+        _setVol(from, 1 - t);
+      }
+      if (!to.released && !silentIncoming) _setVol(to, t);
+      await Future<void>.delayed(Duration(milliseconds: stepMs));
+    }
+  }
+
   void _applyMix() {
     if (!mounted) return;
-    final fading = _incoming != null;
-    final t = fading ? Curves.easeInOutCubic.transform(_fade.value) : 1.0;
+    final fading = _incoming != null && _fade.value > 0;
+    final t = fading ? Curves.easeInOut.transform(_fade.value) : 0.0;
+    // The picture underneath stays fully covered. Only the audio mixes,
+    // so a half-transparent frame cannot uncover the backdrop.
     final currentWeight = !fading
         ? (_held != null ? 0.0 : 1.0)
         : (_keepOutgoingAudio ? 1.0 : (1 - t));
@@ -423,7 +587,24 @@ class _OwlieSequencePlayerState extends State<OwlieSequencePlayer>
     _setVol(_current, currentWeight);
     _setVol(_incoming, incomingWeight);
     _setVol(_held, _held == null ? 0 : 1);
-    setState(() {});
+  }
+
+  void _setClipOpacity(_Slot slot, double opacity) {
+    final shown = opacity <= 0 ? 0.0 : 1.0;
+    final elementId = slot.elementId;
+    if (elementId != null) {
+      setOwnedOpacity(elementId, shown, circular: widget.circular);
+      return;
+    }
+    final seconds = slot.controller.value.isInitialized
+        ? slot.controller.value.position.inMilliseconds / 1000
+        : 0.0;
+    setClipOpacity(
+      clipFileName(slot.path),
+      shown,
+      seconds,
+      circular: widget.circular,
+    );
   }
 
   void _setVol(_Slot? slot, double weight) {
@@ -461,8 +642,6 @@ class _OwlieSequencePlayerState extends State<OwlieSequencePlayer>
   Future<void> _releaseSlot(_Slot? slot) async {
     if (slot == null || slot.released) return;
     slot.released = true;
-    final elementId = slot.elementId;
-    if (elementId != null) setOwnedOpacity(elementId, 0);
     if (identical(_current, slot)) _current = null;
     if (identical(_incoming, slot)) _incoming = null;
     if (identical(_held, slot)) _held = null;
@@ -529,36 +708,23 @@ class _OwlieSequencePlayerState extends State<OwlieSequencePlayer>
       );
     }
 
-    final fading = _incoming != null;
-    final t = fading ? Curves.easeInOutCubic.transform(_fade.value) : 1.0;
-    final currentOpacity = fading ? (1 - t) : 1.0;
-    final incomingOpacity = fading ? t : 0.0;
-
     Widget layer(_Slot slot, double opacity) {
-      final shown = identical(slot, _held) ? 0.02 : opacity.clamp(0.0, 1.0);
-      // The platform view is created a frame after the widget, so claim is
-      // retried until the element exists. Each clip gets its own id so a
-      // same-file crossfade (idle looping) does not restyle the wrong video.
       slot.elementId ??= claimClipElement(clipFileName(slot.path));
-      final elementId = slot.elementId;
-      if (elementId != null) {
-        setOwnedOpacity(elementId, shown);
-      } else {
-        final seconds = slot.controller.value.isInitialized
-            ? slot.controller.value.position.inMilliseconds / 1000
-            : 0.0;
-        setClipOpacity(clipFileName(slot.path), shown, seconds);
-      }
-      if (kIsWeb) return _surface(slot);
-      return Opacity(opacity: shown, child: _surface(slot));
+      _setClipOpacity(slot, opacity);
+      return _surface(slot);
     }
 
     final stack = Stack(
       fit: StackFit.expand,
       children: [
-        if (_held != null) layer(_held!, 0.02),
-        if (_current != null) layer(_current!, currentOpacity),
-        if (_incoming != null) layer(_incoming!, incomingOpacity),
+        if (_held != null)
+          KeyedSubtree(key: ObjectKey(_held), child: layer(_held!, 0)),
+        // The next clip sits fully opaque behind the one on screen. The
+        // visible clip is never faded, so the backdrop cannot show through.
+        if (_incoming != null)
+          KeyedSubtree(key: ObjectKey(_incoming), child: layer(_incoming!, 0)),
+        if (_current != null)
+          KeyedSubtree(key: ObjectKey(_current), child: layer(_current!, 1)),
       ],
     );
 
@@ -566,9 +732,9 @@ class _OwlieSequencePlayerState extends State<OwlieSequencePlayer>
       return stack;
     }
 
-    final ratio = picture.controller.value.aspectRatio == 0
-        ? 1.0
-        : picture.controller.value.aspectRatio;
+    final reported = picture.controller.value.aspectRatio;
+    if (_boxAspect == null && reported > 0) _boxAspect = reported;
+    final ratio = _boxAspect ?? (reported == 0 ? 1.0 : reported);
     return Center(
       child: AspectRatio(aspectRatio: ratio, child: stack),
     );
