@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
@@ -13,12 +15,25 @@ class VideoCache {
   /// web players stay muted so autoplay is allowed.
   static bool _webAudioUnlocked = !kIsWeb;
 
+  static bool get webAudioUnlocked => _webAudioUnlocked;
+
+  static final List<VoidCallback> _unlockListeners = [];
+
+  static void addUnlockListener(VoidCallback listener) {
+    _unlockListeners.add(listener);
+  }
+
+  static void removeUnlockListener(VoidCallback listener) {
+    _unlockListeners.remove(listener);
+  }
+
   static void attach(VideoPlayerController controller) {
     _controllers.add(controller);
   }
 
   static void detach(VideoPlayerController controller) {
     _controllers.remove(controller);
+    _desiredVolume.remove(controller);
   }
 
   static bool isUsable(VideoPlayerController? controller) {
@@ -50,19 +65,67 @@ class VideoCache {
     }
   }
 
-  /// Call from the first pointer event so later clips can play with sound.
+  static final Map<VideoPlayerController, double> _desiredVolume = {};
+  static final Set<VideoPlayerController> _volumeDraining = {};
+
+  /// Queues a mix change so an older [setVolume] cannot finish after a newer
+  /// one and leave the clip muted.
+  static void requestMixVolume(
+    VideoPlayerController controller,
+    double weight,
+  ) {
+    _desiredVolume[controller] = weight;
+    if (!_volumeDraining.add(controller)) return;
+    unawaited(_drainVolume(controller));
+  }
+
+  static Future<void> _drainVolume(VideoPlayerController controller) async {
+    try {
+      while (_desiredVolume.containsKey(controller)) {
+        final target = _desiredVolume.remove(controller)!;
+        await setMixVolume(controller, target);
+      }
+    } finally {
+      _volumeDraining.remove(controller);
+      if (_desiredVolume.containsKey(controller)) {
+        _volumeDraining.add(controller);
+        unawaited(_drainVolume(controller));
+      }
+    }
+  }
+
+  /// Applies [weight] as the clip's volume, keeping web playback muted until
+  /// the first tap. Toggling mute can pause a clip, so playback is resumed.
+  static Future<void> setMixVolume(
+    VideoPlayerController controller,
+    double weight,
+  ) async {
+    if (!isUsable(controller)) return;
+    final target = _webAudioUnlocked ? weight.clamp(0.0, 1.0) : 0.0;
+    final wasPlaying = controller.value.isPlaying;
+    try {
+      await controller.setVolume(target);
+      if (target > 0 &&
+          wasPlaying &&
+          !controller.value.isCompleted &&
+          !controller.value.isPlaying) {
+        await playSafely(controller);
+      }
+    } catch (_) {}
+  }
+
+  /// Call from the first pointer event so clips that are already on screen
+  /// can play with sound.
+  ///
+  /// This must not call play() on every attached controller. Speech clips are
+  /// opened one at a time and left paused at the first frame; starting all of
+  /// them would play hidden audio over the visible animation.
   static Future<void> unlockWebAudio() async {
     if (!kIsWeb || _webAudioUnlocked) return;
     _webAudioUnlocked = true;
-    final snapshot = List<VideoPlayerController>.from(_controllers);
-    for (final controller in snapshot) {
-      if (!isUsable(controller)) continue;
-      try {
-        await controller.setVolume(1);
-        if (!controller.value.isCompleted && !controller.value.isPlaying) {
-          await controller.play();
-        }
-      } catch (_) {}
+    final listeners = List<VoidCallback>.of(_unlockListeners);
+    for (final listener in listeners) {
+      listener();
     }
   }
 

@@ -7,6 +7,8 @@ import '../models/emotion.dart';
 import '../models/exercise.dart';
 import '../state/app_state.dart';
 import '../theme/app_theme.dart';
+import '../utils/media_cache.dart';
+import '../utils/playback_sync.dart';
 import '../widgets/app_shell.dart';
 import '../widgets/emotion_controls.dart';
 import '../widgets/exercise_header_video.dart';
@@ -101,6 +103,10 @@ class _SessionScreenState extends State<SessionScreen> {
   }
 
   void _playExercise(Exercise exercise) {
+    // The list's owl keeps its last frame through the fade, but its audio
+    // must not play over the exercise clip.
+    // ignore: discarded_futures
+    VideoCache.pauseAll();
     setState(() {
       _activeExercise = exercise;
       _phase = _SessionPhase.exerciseVideo;
@@ -151,32 +157,43 @@ class _SessionScreenState extends State<SessionScreen> {
               ),
             )
           : null,
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          if (_phase == _SessionPhase.exerciseVideo && _activeExercise != null)
-            SessionVideoPlayer(
-              key: ValueKey('${_activeExercise!.id}-$_selectedIntensity'),
-              assetPath: _activeExercise!.videoAssetPath,
-              label: '${_activeExercise!.name} video',
-              accentColor: emotion?.accentColor ?? Colors.purpleAccent,
-              actionLabel: widget.directExerciseId != null ? 'Close' : 'Skip',
-              actionIcon: widget.directExerciseId != null
-                  ? Icons.close_rounded
-                  : Icons.skip_next_rounded,
-              onFinished: widget.directExerciseId != null
-                  ? () => Navigator.of(context).pop()
-                  : () => _showExerciseList(afterExercise: true),
-            ),
-          if (_phase == _SessionPhase.exerciseList)
-            _ExerciseListOverlay(
-              exercises: _exercises,
-              intensity: _selectedIntensity,
-              onExerciseSelected: _playExercise,
-              leadAssetPaths: _headerLeads,
-              headerGeneration: _headerGeneration,
-            ),
-        ],
+      body: AnimatedSwitcher(
+        duration: playbackFade,
+        switchInCurve: Curves.easeInOut,
+        switchOutCurve: Curves.easeInOut,
+        layoutBuilder: (current, previous) {
+          return Stack(
+            fit: StackFit.expand,
+            children: [
+              ...previous,
+              ?current,
+            ],
+          );
+        },
+        child: _phase == _SessionPhase.exerciseVideo && _activeExercise != null
+            ? SessionVideoPlayer(
+                key: ValueKey(
+                  'play-${_activeExercise!.id}-$_selectedIntensity',
+                ),
+                assetPath: _activeExercise!.videoAssetPath,
+                label: '${_activeExercise!.name} video',
+                accentColor: emotion?.accentColor ?? Colors.purpleAccent,
+                actionLabel: widget.directExerciseId != null ? 'Close' : 'Skip',
+                actionIcon: widget.directExerciseId != null
+                    ? Icons.close_rounded
+                    : Icons.skip_next_rounded,
+                onFinished: widget.directExerciseId != null
+                    ? () => Navigator.of(context).pop()
+                    : () => _showExerciseList(afterExercise: true),
+              )
+            : _ExerciseListOverlay(
+                key: const ValueKey<String>('exercise-list'),
+                exercises: _exercises,
+                intensity: _selectedIntensity,
+                onExerciseSelected: _playExercise,
+                leadAssetPaths: _headerLeads,
+                headerGeneration: _headerGeneration,
+              ),
       ),
     );
   }
@@ -184,6 +201,7 @@ class _SessionScreenState extends State<SessionScreen> {
 
 class _ExerciseListOverlay extends StatelessWidget {
   const _ExerciseListOverlay({
+    super.key,
     required this.exercises,
     required this.intensity,
     required this.onExerciseSelected,
@@ -207,10 +225,8 @@ class _ExerciseListOverlay extends StatelessWidget {
         Expanded(
           flex: 3,
           child: ExerciseHeaderVideo(
-            key: ValueKey<String>(
-              '${leadAssetPaths.join('|')}-$headerGeneration',
-            ),
             leadAssetPaths: leadAssetPaths,
+            revision: headerGeneration,
           ),
         ),
         Expanded(

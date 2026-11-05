@@ -23,6 +23,7 @@ class EmotionScreen extends StatefulWidget {
 class _EmotionScreenState extends State<EmotionScreen> {
   late EmotionId _selectedEmotionId;
   int? _selectedIntensity;
+  int _clipReplay = 0;
 
   Emotion get _emotion => ContentRepository.emotionById(_selectedEmotionId);
 
@@ -59,13 +60,14 @@ class _EmotionScreenState extends State<EmotionScreen> {
           setState(() {
             _selectedEmotionId = emotion.id;
             _selectedIntensity = null;
+            _clipReplay++;
           });
         },
         onIntensitySelected: _onIntensitySelected,
       ),
       body: OwlPlaceholder(
-        key: ValueKey<EmotionId>(_selectedEmotionId),
         speechAssets: const [OwllieClips.gotcha],
+        replayToken: _clipReplay,
       ),
     );
   }
