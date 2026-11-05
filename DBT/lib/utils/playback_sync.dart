@@ -1,5 +1,12 @@
-/// How long a clip eases into the next one.
-const playbackFade = Duration(milliseconds: 320);
+/// How long the next clip fades in over the one already on screen.
+///
+/// The clip underneath stays fully opaque for this whole interval, so the
+/// backdrop never shows through a gap between the two pictures.
+const playbackFade = Duration(milliseconds: 420);
+
+/// Start the fade this long before it needs to finish, so the old clip is
+/// still showing a real frame when the new one has fully covered it.
+const handoffLead = Duration(milliseconds: 180);
 
 /// Media-clock movement that counts as "audio is still going".
 const stallAdvance = Duration(milliseconds: 350);

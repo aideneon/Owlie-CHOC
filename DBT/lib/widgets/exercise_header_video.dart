@@ -19,9 +19,6 @@ class ExerciseHeaderVideo extends StatelessWidget {
   /// Bump to replay [leadAssetPaths] even when the paths themselves did not change.
   final int revision;
 
-  /// Scales the clip past the oval so a baked-in circular edge is cropped out.
-  static const overscan = 1.12;
-
   @override
   Widget build(BuildContext context) {
     if (leadAssetPaths.isEmpty) {
@@ -58,13 +55,11 @@ class ExerciseHeaderVideo extends StatelessWidget {
               ],
             ),
             child: ClipOval(
-              child: Transform.scale(
-                scale: overscan,
-                child: OwlieSequencePlayer(
-                  speechAssets: leadAssetPaths,
-                  replayToken: revision,
-                  fit: BoxFit.cover,
-                ),
+              child: OwlieSequencePlayer(
+                speechAssets: leadAssetPaths,
+                replayToken: revision,
+                fit: BoxFit.contain,
+                circular: true,
               ),
             ),
           ),
